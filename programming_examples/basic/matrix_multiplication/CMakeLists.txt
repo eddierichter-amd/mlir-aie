@@ -45,6 +45,10 @@ project(${ProjectName})
 
 # Find packages
 find_package(Boost REQUIRED)
+set(ROCM_ROOT "$ENV{ROCM_ROOT}" CACHE STRING "Path to rocm install")
+list(APPEND CMAKE_PREFIX_PATH ${ROCM_ROOT})
+find_package(hsa-runtime64 1.0 REQUIRED)
+
 
 add_executable(${currentTarget}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../runtime_lib/test_lib/test_utils.cpp
@@ -57,6 +61,27 @@ target_include_directories (${currentTarget} PUBLIC
     ${XRT_INC_DIR}
     ${Boost_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../runtime_lib/test_lib
+)
+
+target_link_libraries(${currentTarget}
+  PRIVATE
+    hsa-runtime64::hsa-runtime64
+)
+
+#set_target_properties(${currentTarget}
+#  PROPERTIES
+#    CXX_STANDARD                17
+#    CXX_EXTENSIONS              OFF
+#    CXX_VISIBILITY_PRESET       hidden
+#    VISIBILITY_INLINES_HIDDEN   ON
+#    POSITION_INDEPENDENT_CODE   ON
+#)
+#
+target_compile_options(${currentTarget}
+  PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
 )
 
 target_link_directories(${currentTarget} PUBLIC

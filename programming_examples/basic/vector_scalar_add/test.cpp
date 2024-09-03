@@ -4,151 +4,301 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Copyright (C) 2023, Advanced Micro Devices, Inc.
+// Copyright (C) 2024, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
 #include <boost/program_options.hpp>
 #include <cstdint>
+#include <sstream>
+#include <string>
+#include <cstring>
 #include <fstream>
 #include <iostream>
-#include <sstream>
 #include <string>
 #include <vector>
 
-#include "xrt/xrt_bo.h"
-#include "xrt/xrt_device.h"
-#include "xrt/xrt_kernel.h"
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
-#include "test_utils.h"
+#include "hsa/hsa.h"
+#include "hsa/hsa_ext_amd.h"
+
+namespace {
+
+hsa_status_t get_agent(hsa_agent_t agent, std::vector<hsa_agent_t> *agents,
+                       hsa_device_type_t requested_dev_type)
+{
+  if (!agents || !(requested_dev_type == HSA_DEVICE_TYPE_AIE ||
+      requested_dev_type == HSA_DEVICE_TYPE_GPU)) {
+    return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  hsa_device_type_t device_type;
+  hsa_status_t ret = hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &device_type);
+
+  if (ret != HSA_STATUS_SUCCESS) {
+    return ret;
+  }
+
+  if (device_type == requested_dev_type) {
+    agents->push_back(agent);
+  }
+
+  return ret;
+}
+
+hsa_status_t get_aie_agents(hsa_agent_t agent, void *data)
+{
+  if (!data) {
+    return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  auto* aie_agents = reinterpret_cast<std::vector<hsa_agent_t>*>(data);
+  return get_agent(agent, aie_agents, HSA_DEVICE_TYPE_AIE);
+}
+
+hsa_status_t get_gpu_agents(hsa_agent_t agent, void *data)
+{
+  if (!data) {
+    return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  auto* gpu_agents = reinterpret_cast<std::vector<hsa_agent_t>*>(data);
+  return get_agent(agent, gpu_agents, HSA_DEVICE_TYPE_GPU);
+}
+
+hsa_status_t get_coarse_global_mem_pool(hsa_amd_memory_pool_t pool, void *data, bool kernarg)
+{
+  hsa_amd_segment_t segment_type;
+  auto ret = hsa_amd_memory_pool_get_info(pool, HSA_AMD_MEMORY_POOL_INFO_SEGMENT,
+                                          &segment_type);
+  if (ret != HSA_STATUS_SUCCESS) {
+    return ret;
+  }
+
+  if (segment_type == HSA_AMD_SEGMENT_GLOBAL) {
+    hsa_amd_memory_pool_global_flag_t global_pool_flags;
+    ret = hsa_amd_memory_pool_get_info(pool,
+                                       HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS,
+                                       &global_pool_flags);
+    if (ret != HSA_STATUS_SUCCESS) {
+      return ret;
+    }
+
+    if (kernarg) {
+      if ((global_pool_flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED) &&
+          (global_pool_flags & HSA_REGION_GLOBAL_FLAG_KERNARG)) {
+        *static_cast<hsa_amd_memory_pool_t*>(data) = pool;
+      }
+    } else {
+      if ((global_pool_flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED) &&
+          !(global_pool_flags & HSA_REGION_GLOBAL_FLAG_KERNARG)) {
+        *static_cast<hsa_amd_memory_pool_t*>(data) = pool;
+      }
+    }
+  }
+
+  return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t get_coarse_global_dev_mem_pool(hsa_amd_memory_pool_t pool, void *data)
+{
+  return get_coarse_global_mem_pool(pool, data, false);
+}
+
+hsa_status_t get_coarse_global_kernarg_mem_pool(hsa_amd_memory_pool_t pool, void *data)
+{
+  return get_coarse_global_mem_pool(pool, data, true);
+}
+
+void load_pdi_file(hsa_amd_memory_pool_t mem_pool, const std::string& file_name, void** buf)
+{
+  std::ifstream bin_file(file_name, std::ios::binary | std::ios::ate | std::ios::in);
+
+  assert(!bin_file.fail());
+
+  auto size(bin_file.tellg());
+
+  bin_file.seekg(0, std::ios::beg);
+  assert(hsa_amd_memory_pool_allocate(mem_pool, size, 0, buf) == HSA_STATUS_SUCCESS);
+  bin_file.read(reinterpret_cast<char*>(*buf), size);
+}
+
+void load_instr_file(hsa_amd_memory_pool_t mem_pool, const std::string& file_name, void** buf, uint32_t &num_instr)
+{
+  std::ifstream bin_file(file_name, std::ios::binary | std::ios::ate | std::ios::in);
+
+  assert(!bin_file.fail());
+
+  auto size(bin_file.tellg());
+  bin_file.seekg(0, std::ios::beg);
+  std::vector<uint32_t> pdi_vec;
+  std::string val;
+
+  while (bin_file >> val) {
+    pdi_vec.push_back(std::stoul(val, nullptr, 16));
+  }
+
+  assert(hsa_amd_memory_pool_allocate(mem_pool, size, 0, buf) == HSA_STATUS_SUCCESS);
+  std::memcpy(*buf, pdi_vec.data(), pdi_vec.size() * sizeof(uint32_t));
+  num_instr = pdi_vec.size();
+}
+
+} // namespace
 
 namespace po = boost::program_options;
 
 int main(int argc, const char *argv[]) {
+  // List of AIE agents in the system.
+  std::vector<hsa_agent_t> aie_agents;
+  // For creating a queue on an AIE agent.
+  hsa_queue_t *aie_queue(nullptr);
+  // Memory pool for allocating device-mapped memory. Used for PDI/DPU instructions.
+  hsa_amd_memory_pool_t global_dev_mem_pool{0};
+  // System memory pool. Used for allocating kernel argument data.
+  hsa_amd_memory_pool_t global_kernarg_mem_pool{0};
+  const std::string instr_inst_file_name("./build/insts.txt");
+  const std::string pdi_file_name("./build/aie.mlir.prj/design.pdi");
+  uint32_t *instr_inst_buf(nullptr);
+  uint64_t *pdi_buf(nullptr);
 
-  // ------------------------------------------------------
-  // Parse program arguments
-  // ------------------------------------------------------
-  po::options_description desc("Allowed options");
-  po::variables_map vm;
-  test_utils::add_default_options(desc);
+  assert(aie_agents.empty() && "No aie agents");
+  assert(global_dev_mem_pool.handle == 0);
+  assert(global_kernarg_mem_pool.handle == 0);
 
-  test_utils::parse_options(argc, argv, desc, vm);
-  int verbosity = vm["verbosity"].as<int>();
-  int do_verify = vm["verify"].as<bool>();
-  int n_iterations = vm["iters"].as<int>();
-  int n_warmup_iterations = vm["warmup"].as<int>();
-  int trace_size = vm["trace_sz"].as<int>();
+  // Initialize the runtime.
+  assert(hsa_init() == HSA_STATUS_SUCCESS);
 
-  constexpr int IN_SIZE = 1024;
-  constexpr int OUT_SIZE = 1024;
+  assert(sizeof(hsa_kernel_dispatch_packet_s) == sizeof(hsa_amd_aie_ert_packet_s));
 
-  // Load instruction sequence
-  std::vector<uint32_t> instr_v =
-      test_utils::load_instr_sequence(vm["instr"].as<std::string>());
-  if (verbosity >= 1)
-    std::cout << "Sequence instr count: " << instr_v.size() << "\n";
+  // Find the AIE agents in the system.
+  assert(hsa_iterate_agents(get_aie_agents, &aie_agents) == HSA_STATUS_SUCCESS);
+  assert(aie_agents.size() == 1);
 
-  // ------------------------------------------------------
-  // Get device, load the xclbin & kernel and register them
-  // ------------------------------------------------------
-  // Get a device handle
-  unsigned int device_index = 0;
-  auto device = xrt::device(device_index);
+  const auto& aie_agent = aie_agents.front();
 
-  // Load the xclbin
-  if (verbosity >= 1)
-    std::cout << "Loading xclbin: " << vm["xclbin"].as<std::string>() << "\n";
-  auto xclbin = xrt::xclbin(vm["xclbin"].as<std::string>());
+  // Create a queue on the first agent.
+  assert(hsa_queue_create(aie_agent, 64, HSA_QUEUE_TYPE_SINGLE,
+                           nullptr, nullptr, 0, 0, &aie_queue) == HSA_STATUS_SUCCESS);
+  assert(aie_queue);
+  assert(aie_queue->base_address);
 
-  // Load the kernel
-  if (verbosity >= 1)
-    std::cout << "Kernel opcode: " << vm["kernel"].as<std::string>() << "\n";
-  std::string Node = vm["kernel"].as<std::string>();
 
-  // Get the kernel from the xclbin
-  auto xkernels = xclbin.get_kernels();
-  auto xkernel = *std::find_if(xkernels.begin(), xkernels.end(),
-                               [Node, verbosity](xrt::xclbin::kernel &k) {
-                                 auto name = k.get_name();
-                                 if (verbosity >= 1) {
-                                   std::cout << "Name: " << name << std::endl;
-                                 }
-                                 return name.rfind(Node, 0) == 0;
-                               });
-  auto kernelName = xkernel.get_name();
+  // Find a pool for DEV BOs. This is a global system memory pool that is mapped
+  // to the device. Will be used for PDIs and DPU instructions.
+  assert(hsa_amd_agent_iterate_memory_pools(aie_agent,
+                                             get_coarse_global_dev_mem_pool,
+                                             &global_dev_mem_pool) == HSA_STATUS_SUCCESS);
 
-  // Register xclbin
-  if (verbosity >= 1)
-    std::cout << "Registering xclbin: " << vm["xclbin"].as<std::string>()
-              << "\n";
-  device.register_xclbin(xclbin);
+  // Find a pool that supports kernel args. This is just normal system memory. It will
+  // be used for commands and input data.
+  assert(hsa_amd_agent_iterate_memory_pools(aie_agent,
+                                             get_coarse_global_kernarg_mem_pool,
+                                             &global_kernarg_mem_pool) == HSA_STATUS_SUCCESS);
 
-  // Get a hardware context
-  if (verbosity >= 1)
-    std::cout << "Getting hardware context.\n";
-  xrt::hw_context context(device, xclbin.get_uuid());
+  // Load the DPU and PDI files into a global pool that doesn't support kernel args (DEV BO).
+  uint32_t num_instr;
+  load_instr_file(global_dev_mem_pool, instr_inst_file_name, reinterpret_cast<void**>(&instr_inst_buf), num_instr);
+  uint32_t instr_handle = 0;
+  assert(hsa_amd_get_handle_from_vaddr(instr_inst_buf, &instr_handle) == HSA_STATUS_SUCCESS);
+  assert(instr_handle != 0);
 
-  // Get a kernel handle
-  if (verbosity >= 1)
-    std::cout << "Getting handle to kernel:" << kernelName << "\n";
-  auto kernel = xrt::kernel(context, kernelName);
+  load_pdi_file(global_dev_mem_pool, pdi_file_name, reinterpret_cast<void**>(&pdi_buf));
+  uint32_t pdi_handle = 0;
+  assert(hsa_amd_get_handle_from_vaddr(pdi_buf, &pdi_handle) == HSA_STATUS_SUCCESS);
+  assert(pdi_handle != 0);
 
-  // ------------------------------------------------------
-  // Initialize input/ output buffer sizes and sync them
-  // ------------------------------------------------------
+  hsa_amd_aie_ert_hw_ctx_cu_config_t cu_config {
+    .cu_config_bo = pdi_handle,
+    .cu_func = 0
+  };
 
-  auto bo_instr = xrt::bo(device, instr_v.size() * sizeof(int),
-                          XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
-  auto bo_inA = xrt::bo(device, IN_SIZE * sizeof(int32_t),
-                        XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
-  auto bo_out = xrt::bo(device, OUT_SIZE * sizeof(int32_t),
-                        XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
+  hsa_amd_aie_ert_hw_ctx_config_cu_param_t config_cu_args {
+    .num_cus = 1,
+    .cu_configs = &cu_config
+  };
 
-  if (verbosity >= 1)
-    std::cout << "Writing data into buffer objects.\n";
+  // Configure the queue's hardware context.
+  assert(hsa_amd_queue_hw_ctx_config(aie_queue, HSA_AMD_QUEUE_AIE_ERT_HW_CXT_CONFIG_CU,
+                                      &config_cu_args) == HSA_STATUS_SUCCESS
+  );
 
-  uint32_t *bufInA = bo_inA.map<uint32_t *>();
-  std::vector<uint32_t> srcVecA;
-  for (int i = 0; i < IN_SIZE; i++)
-    srcVecA.push_back(i + 1);
-  memcpy(bufInA, srcVecA.data(), (srcVecA.size() * sizeof(uint32_t)));
+  // create inputs / outputs
+  constexpr std::size_t num_data_elements = 256;
+  constexpr std::size_t data_buffer_size = num_data_elements * sizeof(std::uint32_t);
 
-  void *bufInstr = bo_instr.map<void *>();
-  memcpy(bufInstr, instr_v.data(), instr_v.size() * sizeof(int));
+  std::uint32_t* input = {};
+  assert(hsa_amd_memory_pool_allocate(global_dev_mem_pool,
+                                       data_buffer_size,
+                                       0,
+                                       reinterpret_cast<void**>(&input)) == HSA_STATUS_SUCCESS);
+  std::uint32_t input_handle = {};
+  assert(hsa_amd_get_handle_from_vaddr(input, &input_handle) == HSA_STATUS_SUCCESS);
+  assert(input_handle != 0);
 
-  bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bo_inA.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  std::uint32_t* output = {};
+  assert(hsa_amd_memory_pool_allocate(global_dev_mem_pool,
+                                       data_buffer_size,
+                                       0,
+                                       reinterpret_cast<void**>(&output)) == HSA_STATUS_SUCCESS);
+  std::uint32_t output_handle = {};
+  assert(hsa_amd_get_handle_from_vaddr(output, &output_handle) == HSA_STATUS_SUCCESS);
+  assert(output_handle != 0);
 
-  if (verbosity >= 1)
-    std::cout << "Running Kernel.\n";
-  unsigned int opcode = 3;
-  auto run = kernel(opcode, bo_instr, instr_v.size(), bo_inA, bo_out);
-  run.wait();
-
-  bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-
-  uint32_t *bufOut = bo_out.map<uint32_t *>();
-
-  int errors = 0;
-
-  for (uint32_t i = 0; i < OUT_SIZE; i++) {
-    uint32_t ref = i + 2;
-    if (*(bufOut + i) != ref) {
-      std::cout << "Error in output " << *(bufOut + i) << " != " << ref
-                << std::endl;
-      errors++;
-    } else {
-      std::cout << "Correct output " << *(bufOut + i) << " == " << ref
-                << std::endl;
-    }
+  for (std::size_t i = 0; i < num_data_elements; i++) {
+    *(input + i) = i;
+    *(output + i) = 0xDEFACE;
   }
 
-  if (!errors) {
-    std::cout << "\nPASS!\n\n";
-    return 0;
-  } else {
-    std::cout << "\nfailed.\n\n";
-    return 1;
+  ///////////////////////////////////// Creating the cmd packet
+  // Creating a packet to store the command
+  hsa_amd_aie_ert_packet_t *cmd_pkt = NULL;
+  assert(hsa_amd_memory_pool_allocate(global_kernarg_mem_pool, 64, 0, reinterpret_cast<void**>(&cmd_pkt)) == HSA_STATUS_SUCCESS);
+  cmd_pkt->state = HSA_AMD_AIE_ERT_STATE_NEW;
+  cmd_pkt->count = 0xA; // # of arguments to put in command
+  cmd_pkt->opcode = HSA_AMD_AIE_ERT_START_CU; 
+  cmd_pkt->header.AmdFormat = HSA_AMD_PACKET_TYPE_AIE_ERT; 
+  cmd_pkt->header.header = HSA_PACKET_TYPE_VENDOR_SPECIFIC << HSA_PACKET_HEADER_TYPE;
+
+  // Creating the payload for the packet
+  hsa_amd_aie_ert_start_kernel_data_t *cmd_payload = NULL;
+  uint32_t cmd_handle;
+  assert(hsa_amd_get_handle_from_vaddr(reinterpret_cast<void*>(cmd_pkt), &cmd_handle) == HSA_STATUS_SUCCESS);
+  assert(hsa_amd_memory_pool_allocate(global_kernarg_mem_pool, 64, 0, reinterpret_cast<void**>(&cmd_payload)) == HSA_STATUS_SUCCESS);
+  cmd_payload->cu_mask = 0x1; // Selecting the PDI to use with this command
+  cmd_payload->data[0] = 0x3; // Transaction opcode
+  cmd_payload->data[1] = 0x0;
+  cmd_payload->data[2] = instr_handle; 
+  cmd_payload->data[3] = 0x0;
+  cmd_payload->data[4] = num_instr;
+  cmd_payload->data[5] = input_handle;
+  cmd_payload->data[6] = 0;
+  cmd_payload->data[7] = output_handle;
+  cmd_payload->data[8] = 0;
+  cmd_pkt->payload_data = reinterpret_cast<uint64_t>(cmd_payload);
+
+  uint64_t wr_idx = hsa_queue_add_write_index_relaxed(aie_queue, 1);
+  uint64_t packet_id = wr_idx % aie_queue->size;
+  reinterpret_cast<hsa_amd_aie_ert_packet_t *>(aie_queue->base_address)[packet_id] = *cmd_pkt;
+  hsa_signal_store_screlease(aie_queue->doorbell_signal, wr_idx);
+
+  for (std::size_t i = 0; i < num_data_elements; i++) {
+    const auto expected = *(input + i) + 1;
+    const auto result = *(output + i);
+    assert(result == expected);
   }
+
+  std::cout << "PASS!" << std::endl;
+
+  assert(hsa_queue_destroy(aie_queue) == HSA_STATUS_SUCCESS);
+
+  assert(hsa_amd_memory_pool_free(output) == HSA_STATUS_SUCCESS);
+  assert(hsa_amd_memory_pool_free(input) == HSA_STATUS_SUCCESS);
+  assert(hsa_amd_memory_pool_free(pdi_buf) == HSA_STATUS_SUCCESS);
+  assert(hsa_amd_memory_pool_free(instr_inst_buf) == HSA_STATUS_SUCCESS);
+
+  assert(hsa_shut_down() == HSA_STATUS_SUCCESS);
 }

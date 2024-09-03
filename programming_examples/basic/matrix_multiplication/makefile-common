@@ -68,7 +68,7 @@ trace_size?=65536
 
 target_suffix?=${M}x${K}x${N}
 mlir_target?=build/aie_${target_suffix}.mlir
-xclbin_target?=build/final_${target_suffix}.xclbin
+xclbin_target?=build/aie_${target_suffix}.mlir.prj/design.pdi
 insts_target?=build/insts_${target_suffix}.txt
 
 runargs?=-v 2 --warmup 1 --iters 1
