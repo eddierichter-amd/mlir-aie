@@ -303,7 +303,7 @@ int main(int argc, const char *argv[]) {
   constexpr std::size_t data_buffer_size = num_data_elements * sizeof(std::uint32_t);
 
   A_DATATYPE* input_a = {};
-  assert(hsa_amd_memory_pool_allocate(global_dev_mem_pool,
+  assert(hsa_amd_memory_pool_allocate(global_kernarg_mem_pool,
                                        A_SIZE,
                                        0,
                                        reinterpret_cast<void**>(&input_a)) == HSA_STATUS_SUCCESS);
@@ -313,7 +313,7 @@ int main(int argc, const char *argv[]) {
 
 
   B_DATATYPE* input_b = {};
-  assert(hsa_amd_memory_pool_allocate(global_dev_mem_pool,
+  assert(hsa_amd_memory_pool_allocate(global_kernarg_mem_pool,
                                        B_SIZE,
                                        0,
                                        reinterpret_cast<void**>(&input_b)) == HSA_STATUS_SUCCESS);
@@ -322,7 +322,7 @@ int main(int argc, const char *argv[]) {
   assert(input_b_handle != 0);
 
   C_DATATYPE* output = {};
-  assert(hsa_amd_memory_pool_allocate(global_dev_mem_pool,
+  assert(hsa_amd_memory_pool_allocate(global_kernarg_mem_pool,
                                        OUT_SIZE,
                                        0,
                                        reinterpret_cast<void**>(&output)) == HSA_STATUS_SUCCESS);
